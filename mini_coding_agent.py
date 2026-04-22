@@ -1,5 +1,6 @@
 import argparse
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -222,6 +223,54 @@ class OllamaModelClient:
         return data.get("response", "")
 
 
+class OpenAIChatModelClient:
+    def __init__(self, model, base_url, api_key, temperature, top_p, timeout):
+        self.model = model
+        self.base_url = base_url.rstrip("/")
+        self.api_key = api_key
+        self.temperature = temperature
+        self.top_p = top_p
+        self.timeout = timeout
+
+    def complete(self, prompt, max_new_tokens):
+        payload = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": False,
+            "temperature": self.temperature,
+            "top_p": self.top_p,
+            "max_tokens": max_new_tokens,
+        }
+        request = urllib.request.Request(
+            self.base_url + "/chat/completions",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self.api_key}",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                data = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"OpenAI-compatible request failed with HTTP {exc.code}: {body}") from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(
+                "Could not reach OpenAI-compatible endpoint.\n"
+                f"Base URL: {self.base_url}\n"
+                f"Model: {self.model}"
+            ) from exc
+
+        if isinstance(data, dict) and data.get("error"):
+            raise RuntimeError(f"OpenAI-compatible error: {data['error']}")
+        try:
+            return data["choices"][0]["message"]["content"] or ""
+        except (KeyError, IndexError, TypeError) as exc:
+            raise RuntimeError(f"Unexpected response shape: {data}") from exc
+
+
 class MiniAgent:
     def __init__(
         self,
@@ -366,7 +415,7 @@ class MiniAgent:
             "- Required tool arguments must not be empty. Do not call read_file, write_file, patch_file, run_shell, or delegate with args={}.",
         ])
         return "\n\n".join([
-            "You are Mini-Coding-Agent, a small local coding agent running through Ollama.",
+            "You are Mini-Coding-Agent, a small coding agent driven by a local or OpenAI-compatible LLM backend.",
             "Rules:\n" + rules,
             "Tools:\n" + tool_text,
             "Valid response examples:\n" + examples,
@@ -909,16 +958,37 @@ def build_welcome(agent, model, host):
     return "\n".join([line, *rows, line])
 
 
-def build_agent(args):
-    workspace = WorkspaceContext.build(args.cwd)
-    store = SessionStore(Path(workspace.repo_root) / ".mini-coding-agent" / "sessions")
-    model = OllamaModelClient(
+def build_model_client(args):
+    if args.provider == "openai":
+        api_key = args.api_key or os.environ.get("OPENAI_API_KEY") or os.environ.get("DASHSCOPE_API_KEY")
+        if not api_key:
+            raise SystemExit(
+                "error: --api-key is required for provider 'openai' "
+                "(or set OPENAI_API_KEY / DASHSCOPE_API_KEY)."
+            )
+        if not args.base_url:
+            raise SystemExit("error: --base-url is required for provider 'openai'.")
+        return OpenAIChatModelClient(
+            model=args.model,
+            base_url=args.base_url,
+            api_key=api_key,
+            temperature=args.temperature,
+            top_p=args.top_p,
+            timeout=args.request_timeout,
+        )
+    return OllamaModelClient(
         model=args.model,
         host=args.host,
         temperature=args.temperature,
         top_p=args.top_p,
-        timeout=args.ollama_timeout,
+        timeout=args.request_timeout,
     )
+
+
+def build_agent(args):
+    workspace = WorkspaceContext.build(args.cwd)
+    store = SessionStore(Path(workspace.repo_root) / ".mini-coding-agent" / "sessions")
+    model = build_model_client(args)
     session_id = args.resume
     if session_id == "latest":
         session_id = store.latest()
@@ -949,9 +1019,30 @@ def build_arg_parser():
     )
     parser.add_argument("prompt", nargs="*", help="Optional one-shot prompt.")
     parser.add_argument("--cwd", default=".", help="Workspace directory.")
-    parser.add_argument("--model", default="qwen3.5:4b", help="Ollama model name.")
+    parser.add_argument(
+        "--provider",
+        choices=("ollama", "openai"),
+        default="ollama",
+        help="Model backend. 'openai' targets any OpenAI-compatible /chat/completions endpoint (e.g. DashScope).",
+    )
+    parser.add_argument("--model", default="qwen3.5:4b", help="Model name (Ollama tag or OpenAI-compatible model id).")
     parser.add_argument("--host", default="http://127.0.0.1:11434", help="Ollama server URL.")
-    parser.add_argument("--ollama-timeout", type=int, default=300, help="Ollama request timeout in seconds.")
+    parser.add_argument(
+        "--base-url",
+        default=None,
+        help="OpenAI-compatible base URL, e.g. https://dashscope.aliyuncs.com/compatible-mode/v1",
+    )
+    parser.add_argument(
+        "--api-key",
+        default=None,
+        help="API key for OpenAI-compatible provider. Falls back to OPENAI_API_KEY or DASHSCOPE_API_KEY.",
+    )
+    parser.add_argument(
+        "--request-timeout",
+        type=int,
+        default=300,
+        help="HTTP request timeout in seconds for the model backend.",
+    )
     parser.add_argument("--resume", default=None, help="Session id to resume or 'latest'.")
     parser.add_argument(
         "--approval",
@@ -970,7 +1061,8 @@ def main(argv=None):
     args = build_arg_parser().parse_args(argv)
     agent = build_agent(args)
 
-    print(build_welcome(agent, model=args.model, host=args.host))
+    endpoint = args.base_url if args.provider == "openai" else args.host
+    print(build_welcome(agent, model=args.model, host=endpoint))
 
     if args.prompt:
         prompt = " ".join(args.prompt).strip()
